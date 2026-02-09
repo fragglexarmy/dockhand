@@ -489,7 +489,7 @@ export async function dockerFetch(
 				body,
 				headers,
 				streaming || false,
-				streaming ? 300000 : 30000 // 5 min for streaming, 30s for normal requests
+				(streaming || path === '/_hawser/compose') ? 300000 : 30000 // 5 min for streaming/compose, 30s for normal
 			);
 			const elapsed = Date.now() - startTime;
 			// Only warn for slow requests, but skip /stats which is expected to be slow (5-10s)
@@ -609,8 +609,10 @@ export async function dockerFetch(
 		}
 
 		// Add default timeout for non-streaming requests to prevent socket accumulation
+		// Compose operations need more time (up to 5 minutes) for multi-service stacks
 		if (!streaming && !finalOptions.signal) {
-			finalOptions.signal = AbortSignal.timeout(30000);
+			const isComposeOperation = path === '/_hawser/compose';
+			finalOptions.signal = AbortSignal.timeout(isComposeOperation ? 300000 : 30000);
 		}
 
 		try {
