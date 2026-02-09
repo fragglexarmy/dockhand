@@ -1339,6 +1339,195 @@ export async function createContainer(options: CreateContainerOptions, envId?: n
 }
 
 /**
+ * Recreate a container using full Config/HostConfig passthrough from inspect data.
+ * Passes Config and HostConfig directly from inspect to create, only changing
+ * the image. No field mapping or stripping.
+ *
+ * Flow:
+ * 1. Stop container
+ * 2. Rename to name-old (frees the name for the new container)
+ * 3. Disconnect all networks (frees static IPs)
+ * 4. Create new container with original name, one network
+ * 5. Connect additional networks
+ * 6. Start new container
+ * 7. Remove old container
+ *
+ * On failure: rollback (rename old back, reconnect networks, restart old)
+ */
+export async function recreateContainerFromInspect(
+	inspectData: any,
+	newImage: string,
+	envId?: number | null,
+	log?: (msg: string) => void
+): Promise<{ Id: string }> {
+	const config = inspectData.Config || {};
+	const hostConfig = inspectData.HostConfig || {};
+	const networks: Record<string, any> = inspectData.NetworkSettings?.Networks || {};
+	const name = inspectData.Name?.replace(/^\//, '') || '';
+	const oldContainerId = inspectData.Id;
+	const wasRunning = inspectData.State?.Running;
+
+	// 1. Stop the container
+	if (wasRunning) {
+		log?.('Stopping container...');
+		await stopContainer(oldContainerId, envId);
+	}
+
+	// 2. Rename old container to free the name
+	log?.('Renaming old container...');
+	await dockerFetch(
+		`/containers/${oldContainerId}/rename?name=${encodeURIComponent(name + '-old')}`,
+		{ method: 'POST' },
+		envId
+	).then(r => { if (!r.ok) throw new Error('Failed to rename old container'); });
+
+	// 3. Disconnect all networks from old container (frees static IPs)
+	// Capture the first network for use during container creation
+	let initialNetworkName: string | null = null;
+	let initialNetworkConfig: any = null;
+
+	for (const [netName, netConfig] of Object.entries(networks)) {
+		const networkId = (netConfig as any).NetworkID;
+		if (networkId) {
+			try {
+				await disconnectContainerFromNetwork(networkId, oldContainerId, true, envId);
+			} catch {
+				// Best effort - network may already be disconnected
+			}
+		}
+
+		// Use first network for creation
+		if (!initialNetworkName) {
+			initialNetworkName = netName;
+			initialNetworkConfig = netConfig;
+		}
+	}
+
+	// Rollback helper: restore old container on failure
+	const rollback = async () => {
+		try {
+			log?.('Rolling back: restoring old container...');
+			// Rename back
+			await dockerFetch(
+				`/containers/${oldContainerId}/rename?name=${encodeURIComponent(name)}`,
+				{ method: 'POST' },
+				envId
+			).catch(() => {});
+
+			// Reconnect networks using full EndpointSettings from inspect
+			for (const [, netConfig] of Object.entries(networks)) {
+				const nc = netConfig as any;
+				if (nc.NetworkID) {
+					await connectContainerToNetworkRaw(nc.NetworkID, oldContainerId, nc, envId).catch(() => {});
+				}
+			}
+
+			// Restart
+			if (wasRunning) {
+				await startContainer(oldContainerId, envId).catch(() => {});
+			}
+		} catch {
+			log?.('Rollback failed');
+		}
+	};
+
+	// 4. Build create config - pass Config and HostConfig directly from inspect
+	const createConfig: any = {
+		...config,
+		Image: newImage,
+		HostConfig: hostConfig
+	};
+
+	// Preserve anonymous volumes from Mounts not in HostConfig.Binds
+	const existingBinds = new Set((hostConfig.Binds || []).map((b: string) => {
+		const parts = b.split(':');
+		return parts.length >= 2 ? parts[1] : parts[0];
+	}));
+	const mounts = inspectData.Mounts || [];
+	const additionalBinds: string[] = [];
+	for (const mount of mounts) {
+		if (mount.Type === 'volume' && mount.Name && mount.Destination) {
+			if (!existingBinds.has(mount.Destination)) {
+				additionalBinds.push(`${mount.Name}:${mount.Destination}`);
+			}
+		}
+	}
+	if (additionalBinds.length > 0) {
+		createConfig.HostConfig = {
+			...hostConfig,
+			Binds: [...(hostConfig.Binds || []), ...additionalBinds]
+		};
+	}
+
+	// Docker can only connect to one network at creation. Pass the first network
+	// from the old container's settings to avoid getting a random bridge IP.
+	// Clear MacAddress for Docker API < 1.44 compatibility.
+	if (initialNetworkName && initialNetworkConfig) {
+		const endpointConfig = { ...initialNetworkConfig };
+		delete endpointConfig.MacAddress;
+		createConfig.NetworkingConfig = {
+			EndpointsConfig: {
+				[initialNetworkName]: endpointConfig
+			}
+		};
+	}
+
+	// 5. Create new container
+	log?.('Creating new container...');
+	let newContainerId: string;
+	try {
+		const result = await dockerJsonRequest<{ Id: string }>(
+			`/containers/create?name=${encodeURIComponent(name)}`,
+			{
+				method: 'POST',
+				body: JSON.stringify(createConfig)
+			},
+			envId
+		);
+		newContainerId = result.Id;
+	} catch (createError: any) {
+		log?.(`Create failed: ${createError.message}`);
+		await rollback();
+		throw createError;
+	}
+
+	// 6. Connect additional networks using full EndpointSettings from inspect
+	for (const [netName, netConfig] of Object.entries(networks)) {
+		if (netName === initialNetworkName) continue; // Already connected at creation
+
+		const nc = netConfig as any;
+		if (nc.NetworkID) {
+			try {
+				await connectContainerToNetworkRaw(nc.NetworkID, newContainerId, nc, envId);
+			} catch (netError: any) {
+				log?.(`Warning: Failed to connect to network "${netName}": ${netError.message}`);
+			}
+		}
+	}
+
+	// 7. Start new container
+	if (wasRunning) {
+		log?.('Starting new container...');
+		try {
+			await startContainer(newContainerId, envId);
+		} catch (startError: any) {
+			log?.(`Start failed: ${startError.message}, rolling back...`);
+			// Remove failed new container
+			await removeContainer(newContainerId, true, envId).catch(() => {});
+			await rollback();
+			throw startError;
+		}
+	}
+
+	// 8. Remove old container (best effort)
+	log?.('Removing old container...');
+	await removeContainer(oldContainerId, true, envId).catch(() => {});
+
+	log?.('Container recreated successfully');
+	return { Id: newContainerId };
+}
+
+/**
  * Extract all container options from Docker inspect data.
  * This preserves ALL container settings for recreation.
  * Used by both updateContainer and recreateContainer to ensure consistency.
@@ -2751,6 +2940,37 @@ export async function connectContainerToNetwork(
 			body.EndpointConfig.GwPriority = options.gwPriority;
 		}
 	}
+
+	const response = await dockerFetch(
+		`/networks/${networkId}/connect`,
+		{
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		},
+		envId
+	);
+	if (!response.ok) {
+		const data = await response.json().catch(() => ({}));
+		throw new Error(data.message || 'Failed to connect container to network');
+	}
+}
+
+/**
+ * Connect a container to a network using a raw EndpointSettings object from inspect data.
+ * Passes the full EndpointSettings as-is, preserving all fields (Links, DriverOpts,
+ * IPAMConfig.LinkLocalIPs, MacAddress, etc.) without manual field extraction.
+ */
+export async function connectContainerToNetworkRaw(
+	networkId: string,
+	containerId: string,
+	endpointSettings: any,
+	envId?: number | null
+): Promise<void> {
+	const body: any = {
+		Container: containerId,
+		EndpointConfig: endpointSettings
+	};
 
 	const response = await dockerFetch(
 		`/networks/${networkId}/connect`,

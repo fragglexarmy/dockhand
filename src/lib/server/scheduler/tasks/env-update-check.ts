@@ -26,13 +26,12 @@ import {
 	isDigestBasedImage,
 	getImageIdByTag,
 	removeTempImage,
-	tagImage
+	tagImage,
 } from '../../docker';
 import { sendEventNotification } from '../../notifications';
 import { getScannerSettings, scanImage, type VulnerabilitySeverity } from '../../scanner';
 import { parseImageNameAndTag, shouldBlockUpdate, combineScanSummaries, isSystemContainer } from './update-utils';
-import { recreateContainer, updateStackContainer } from './container-update';
-import { pullStackService } from '../../stacks';
+import { recreateContainer } from './container-update';
 
 interface UpdateInfo {
 	containerId: string;
@@ -236,34 +235,14 @@ export async function runEnvUpdateCheckJob(
 				try {
 					await log(`\nUpdating: ${update.containerName}`);
 
-					// Get full container config
-					const inspectData = await inspectContainer(update.containerId, environmentId) as any;
-					const containerConfig = inspectData.Config;
-
-					// Detect stack membership early (needed for both pull and recreate)
-					const containerLabels = containerConfig.Labels || {};
-					const composeProject = containerLabels['com.docker.compose.project'];
-					const composeService = containerLabels['com.docker.compose.service'];
-					const composeConfigFiles = containerLabels['com.docker.compose.project.config_files'];
-					const isStackContainer = !!(composeProject && composeService);
-
 					// SAFE-PULL FLOW
 					if (shouldScan && !isDigestBasedImage(update.imageName)) {
 						const tempTag = getTempImageTag(update.imageName);
 						await log(`  Safe-pull with temp tag: ${tempTag}`);
 
 						// Step 1: Pull new image
-						if (isStackContainer) {
-							await log(`  Pulling via compose (stack: ${composeProject}, service: ${composeService})...`);
-							const pullResult = await pullStackService(composeProject, composeService, environmentId, composeConfigFiles);
-							if (!pullResult.success) {
-								await log(`  Compose pull failed, falling back to direct pull...`);
-								await pullImage(update.imageName, () => {}, environmentId);
-							}
-						} else {
-							await log(`  Pulling ${update.imageName}...`);
-							await pullImage(update.imageName, () => {}, environmentId);
-						}
+						await log(`  Pulling ${update.imageName}...`);
+						await pullImage(update.imageName, () => {}, environmentId);
 
 						// Step 2: Get new image ID
 						const newImageId = await getImageIdByTag(update.imageName, environmentId);
@@ -372,39 +351,15 @@ export async function runEnvUpdateCheckJob(
 						} catch { /* ignore cleanup errors */ }
 					} else {
 						// Simple pull (no scanning or digest-based image)
-						if (isStackContainer) {
-							await log(`  Pulling via compose (stack: ${composeProject}, service: ${composeService})...`);
-							const pullResult = await pullStackService(composeProject, composeService, environmentId, composeConfigFiles);
-							if (!pullResult.success) {
-								await log(`  Compose pull failed, falling back to direct pull...`);
-								await pullImage(update.imageName, () => {}, environmentId);
-							}
-						} else {
-							await log(`  Pulling ${update.imageName}...`);
-							await pullImage(update.imageName, () => {}, environmentId);
-						}
+						await log(`  Pulling ${update.imageName}...`);
+						await pullImage(update.imageName, () => {}, environmentId);
 					}
 
-					// Recreate container using compose-native or full recreation
-					if (isStackContainer) {
-						await log(`  Updating via compose (stack: ${composeProject}, service: ${composeService})`);
-						const stackSuccess = await updateStackContainer(
-							composeProject, composeService, environmentId,
-							(msg) => { log(`  ${msg}`); },
-							composeConfigFiles
-						);
-						if (!stackSuccess) {
-							await log(`  Compose file not found, falling back to container recreation...`);
-							const ok = await recreateContainer(update.containerName, environmentId,
-								(msg) => { log(`  ${msg}`); });
-							if (!ok) throw new Error('Container recreation failed');
-						}
-					} else {
-						await log(`  Recreating standalone container...`);
-						const ok = await recreateContainer(update.containerName, environmentId,
-							(msg) => { log(`  ${msg}`); });
-						if (!ok) throw new Error('Container recreation failed');
-					}
+					// Recreate container with full config passthrough
+					await log(`  Recreating container...`);
+					const ok = await recreateContainer(update.containerName, environmentId,
+						(msg) => { log(`  ${msg}`); });
+					if (!ok) throw new Error('Container recreation failed');
 
 					await log(`  Updated successfully`);
 					successCount++;

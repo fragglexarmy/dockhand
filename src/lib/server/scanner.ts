@@ -593,19 +593,21 @@ async function runScannerContainerCore(
 		(connectionType === 'direct' && !env?.host);
 
 	let hostSocketPath: string;
-	let containerUser: string | undefined;
+	let rootlessUid: string | undefined;
 
 	if (isLocalSocket) {
 		// Local socket environment - detect host socket path (handles rootless Docker)
 		hostSocketPath = getHostDockerSocket();
 		console.log(`[Scanner] Local socket scan (${connectionType || 'default'}) - detected host Docker socket: ${hostSocketPath}`);
 
-		// For user-specific Docker sockets, run scanner as that user
-		// e.g., /run/user/1000/docker.sock -> run as UID 1000
+		// For user-specific Docker sockets (rootless Docker), detect UID for cache ownership
+		// but do NOT set container user — in rootless Docker, root inside the container
+		// maps to the socket-owning UID on the host via user namespace remapping
 		const uid = extractUidFromSocketPath(hostSocketPath);
 		if (uid) {
-			containerUser = uid;
-			console.log(`[Scanner] Rootless Docker detected (UID ${containerUser})`);
+			rootlessUid = uid;
+			console.log(`[Scanner] Rootless Docker detected (UID ${rootlessUid})`);
+			console.log(`[Scanner] Scanner will run as root inside container (maps to UID ${rootlessUid} on host via user namespace)`);
 		}
 	} else {
 		// Remote environment (direct with host/hawser-standard/hawser-edge)
@@ -620,9 +622,9 @@ async function runScannerContainerCore(
 	let cacheBind: string;
 	const volumeName = scannerType === 'grype' ? GRYPE_VOLUME_NAME : TRIVY_VOLUME_NAME;
 
-	if (containerUser) {
+	if (rootlessUid) {
 		// Rootless Docker: use bind mount from data directory with correct ownership
-		const hostCachePath = await ensureScannerCacheDir(scannerType, containerUser);
+		const hostCachePath = await ensureScannerCacheDir(scannerType, rootlessUid);
 		cacheBind = `${hostCachePath}:${basePath}`;
 		console.log(`[Scanner] Rootless mode - using bind mount: ${cacheBind}`);
 	} else {
@@ -646,10 +648,6 @@ async function runScannerContainerCore(
 
 	console.log(`[Scanner] Running ${scannerType} with cache mounted at ${basePath}`);
 	console.log(`[Scanner] Container command: ${cmd.join(' ')}`);
-	if (containerUser) {
-		console.log(`[Scanner] Running scanner container as UID ${containerUser} to match socket owner`);
-	}
-
 	// Run the scanner container with a 10-minute timeout to prevent indefinite hangs
 	const output = await runContainerWithStreaming({
 		image: scannerImage,
@@ -657,7 +655,6 @@ async function runScannerContainerCore(
 		binds,
 		env: envVars,
 		name: `dockhand-${scannerType}-${Date.now()}`,
-		user: containerUser,
 		envId,
 		timeout: 600_000, // 10 minutes
 		onStderr: (data) => {

@@ -1,5 +1,16 @@
 [
   {
+    "version": "1.0.17",
+    "date": "2026-02-09",
+    "comingSoon": false,
+    "changes": [
+      { "type": "fix", "text": "Fix scanner failure on rootless Docker" },
+      { "type": "fix", "text": "Increase Hawser compose operation timeout" },
+      { "type": "fix", "text": "Fix regression in stack container updates" }
+    ],
+    "imageTag": "fnsys/dockhand:v1.0.17"
+  },
+  {
     "version": "1.0.16",
     "date": "2026-02-09",
     "changes": [

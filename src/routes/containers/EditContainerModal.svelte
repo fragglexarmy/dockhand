@@ -1108,8 +1108,6 @@
 					bind:autoUpdateEnabled
 					bind:autoUpdateCronExpression
 					bind:vulnerabilityCriteria
-					{isComposeContainer}
-					{composeStackName}
 					{configSets}
 					bind:selectedConfigSetId
 					bind:errors

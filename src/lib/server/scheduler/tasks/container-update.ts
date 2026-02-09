@@ -2,13 +2,9 @@
  * Container Auto-Update Task
  *
  * Handles automatic container updates with vulnerability scanning.
- *
- * For containers that are part of a Docker Compose stack, updates use
- * `docker compose up -d` to preserve ALL configuration from the compose file
- * (network aliases, static IPs, health checks, resource limits, etc.).
- *
- * For standalone containers, updates use container recreation with comprehensive
- * settings preservation.
+ * Uses direct Docker API recreation with full Config/HostConfig passthrough
+ * from inspect data. No compose commands for
+ * individual container updates, no manual field mapping, zero settings loss.
  */
 
 import type { ScheduleTrigger, VulnerabilityCriteria } from '../../db';
@@ -26,7 +22,6 @@ import {
 	pullImage,
 	listContainers,
 	inspectContainer,
-	createContainer,
 	stopContainer,
 	startContainer,
 	removeContainer,
@@ -37,12 +32,12 @@ import {
 	removeTempImage,
 	tagImage,
 	connectContainerToNetwork,
-	extractContainerOptions
+	disconnectContainerFromNetwork,
+	recreateContainerFromInspect
 } from '../../docker';
 import { getScannerSettings, scanImage, type ScanResult, type VulnerabilitySeverity } from '../../scanner';
 import { sendEventNotification } from '../../notifications';
 import { parseImageNameAndTag, shouldBlockUpdate, combineScanSummaries, isSystemContainer } from './update-utils';
-import { getStackComposeFile, updateStackService, pullStackService } from '../../stacks';
 
 // =============================================================================
 // TYPES
@@ -392,19 +387,6 @@ export async function runContainerUpdate(
 		log(`Container is using image: ${imageNameFromConfig}`);
 		log(`Current image ID: ${currentImageId?.substring(0, 19)}`);
 
-		// Detect if container is part of a Docker Compose stack
-		const containerLabels = inspectData.Config?.Labels || {};
-		const composeProject = containerLabels['com.docker.compose.project'];
-		const composeService = containerLabels['com.docker.compose.service'];
-		const composeConfigFiles = containerLabels['com.docker.compose.project.config_files'];
-		const isStackContainer = !!(composeProject && composeService);
-
-		if (isStackContainer) {
-			log(`Container is part of compose stack: ${composeProject} (service: ${composeService}, configFiles: ${composeConfigFiles || 'none'})`);
-		} else {
-			log(`Container is standalone (not part of a compose stack)`);
-		}
-
 		// Get scanner and schedule settings early to determine scan strategy
 		const [scannerSettings, updateSetting] = await Promise.all([
 			getScannerSettings(envId),
@@ -458,150 +440,7 @@ export async function runContainerUpdate(
 		const newDigest = registryCheck.registryDigest;
 
 		// =============================================================================
-		// STACK CONTAINER: Compose-native flow
-		// =============================================================================
-		// 1. Check if we have the compose file
-		// 2. docker compose pull <service>
-		// 3. Scan if enabled, block if needed
-		// 4. docker compose up -d <service>
-		// =============================================================================
-
-		if (isStackContainer) {
-			const composeResult = await getStackComposeFile(composeProject, envId, composeConfigFiles);
-			log(`Compose lookup result: success=${composeResult.success}, composePath=${composeResult.composePath || 'none'}`);
-
-			if (composeResult.success) {
-				log(`Using compose-native update for stack: ${composeProject}`);
-
-				try {
-					// Pull via docker compose
-					log(`Running: docker compose pull ${composeService}`);
-					const pullResult = await pullStackService(composeProject, composeService, envId, composeConfigFiles);
-					if (!pullResult.success) {
-						throw new Error(pullResult.error || 'docker compose pull failed');
-					}
-					log(`Compose pull completed`);
-
-					// Get new image ID
-					const newImageId = await getImageIdByTag(imageNameFromConfig, envId);
-					if (!newImageId) {
-						throw new Error('Failed to get new image ID after compose pull');
-					}
-					log(`New image ID: ${newImageId.substring(0, 19)}`);
-
-					// Scan if enabled
-					let scanOutcome: ScanOutcome = { blocked: false };
-					if (shouldScan) {
-						try {
-							scanOutcome = await scanAndCheckBlock({
-								newImageId,
-								currentImageId,
-								envId,
-								vulnerabilityCriteria,
-								log
-							});
-
-							if (scanOutcome.blocked) {
-								// Restore old tag so container keeps using safe image
-								log(`Restoring original tag to safe image...`);
-								const [oldRepo, oldTag] = parseImageNameAndTag(imageNameFromConfig);
-								await tagImage(currentImageId, oldRepo, oldTag, envId);
-
-								await updateScheduleExecution(execution.id, {
-									status: 'skipped',
-									completedAt: new Date().toISOString(),
-									duration: Date.now() - startTime,
-									details: buildBlockedDetails(
-										containerName,
-										vulnerabilityCriteria,
-										scanOutcome.reason!,
-										scanOutcome.scanResults!,
-										scanOutcome.scanSummary!
-									)
-								});
-
-								await sendEventNotification('auto_update_blocked', {
-									title: 'Auto-update blocked',
-									message: `Container "${containerName}" update blocked: ${scanOutcome.reason}`,
-									type: 'warning'
-								}, envId);
-
-								return;
-							}
-						} catch (scanError: any) {
-							log(`Scan failed: ${scanError.message}`);
-							log(`Restoring original tag...`);
-							const [oldRepo, oldTag] = parseImageNameAndTag(imageNameFromConfig);
-							await tagImage(currentImageId, oldRepo, oldTag, envId);
-
-							await updateScheduleExecution(execution.id, {
-								status: 'failed',
-								completedAt: new Date().toISOString(),
-								duration: Date.now() - startTime,
-								errorMessage: `Vulnerability scan failed: ${scanError.message}`
-							});
-							return;
-						}
-					}
-
-					// Apply update via docker compose up
-					log(`Running: docker compose up -d ${composeService}`);
-					const upResult = await updateStackService(composeProject, composeService, envId, composeConfigFiles);
-					if (!upResult.success) {
-						throw new Error(upResult.error || 'docker compose up failed');
-					}
-
-					// Success
-					await updateAutoUpdateLastUpdated(containerName, envId);
-					log(`Successfully updated container: ${containerName}`);
-
-					await updateScheduleExecution(execution.id, {
-						status: 'success',
-						completedAt: new Date().toISOString(),
-						duration: Date.now() - startTime,
-						details: buildSuccessDetails(
-							containerName,
-							newDigest,
-							vulnerabilityCriteria,
-							scanOutcome.scanResults,
-							scanOutcome.scanSummary
-						)
-					});
-
-					await sendEventNotification('auto_update_success', {
-						title: 'Container auto-updated',
-						message: `Container "${containerName}" was updated to a new image version`,
-						type: 'success'
-					}, envId);
-
-					return;
-
-				} catch (composeError: any) {
-					log(`Compose update failed: ${composeError.message}`);
-					await updateScheduleExecution(execution.id, {
-						status: 'failed',
-						completedAt: new Date().toISOString(),
-						duration: Date.now() - startTime,
-						errorMessage: `Stack update failed: ${composeError.message}`
-					});
-
-					await sendEventNotification('auto_update_failed', {
-						title: 'Auto-update failed',
-						message: `Container "${containerName}" auto-update failed: ${composeError.message}`,
-						type: 'error'
-					}, envId);
-
-					return;
-				}
-			}
-
-			// No compose file found - fall through to standalone flow
-			log(`No compose file found for stack "${composeProject}" - using standalone update`);
-			log(`TIP: Import this stack into Dockhand for compose-native updates`);
-		}
-
-		// =============================================================================
-		// STANDALONE CONTAINER: Temp-tag protection flow
+		// PULL & SCAN: Temp-tag protection flow
 		// =============================================================================
 		// 1. Pull new image (overwrites tag)
 		// 2. Restore original tag to OLD image (safety)
@@ -726,16 +565,10 @@ export async function runContainerUpdate(
 		}
 
 		// =============================================================================
-		// RECREATE CONTAINER
+		// RECREATE CONTAINER (full config passthrough from inspect data)
 		// =============================================================================
 
-		if (isStackContainer) {
-			log(`External stack - recreating container directly`);
-			log(`WARNING: Some compose settings may not be preserved`);
-		} else {
-			log(`Recreating standalone container...`);
-		}
-
+		log(`Recreating container with full config passthrough...`);
 		const success = await recreateContainer(containerName, envId, log);
 
 		if (success) {
@@ -786,8 +619,9 @@ export async function runContainerUpdate(
 // =============================================================================
 
 /**
- * Recreate a standalone container with comprehensive settings preservation.
- * Extracts and preserves 50+ container settings from the original container.
+ * Recreate a container using full Config/HostConfig passthrough from inspect data.
+ * Passes inspect data directly to Docker API create, only changing the image.
+ * No manual field mapping — zero settings loss.
  */
 export async function recreateContainer(
 	containerName: string,
@@ -804,104 +638,11 @@ export async function recreateContainer(
 		}
 
 		const inspectData = await inspectContainer(container.id, envId) as any;
-		const wasRunning = inspectData.State.Running;
-		const hostConfig = inspectData.HostConfig;
-		const config = inspectData.Config;
+		const imageName = inspectData.Config?.Image;
 
-		log?.(`Recreating container: ${containerName} (was running: ${wasRunning})`);
-		log?.(`Preserving all container settings...`);
+		log?.(`Recreating container: ${containerName} (image: ${imageName})`);
 
-		if (wasRunning) {
-			log?.('Stopping container...');
-			await stopContainer(container.id, envId);
-		}
-
-		log?.('Removing old container...');
-		await removeContainer(container.id, true, envId);
-
-		const containerOptions = extractContainerOptions(inspectData);
-
-		// Handle additional networks
-		const networkSettings = inspectData.NetworkSettings?.Networks || {};
-		const primaryNetwork = hostConfig.NetworkMode || 'bridge';
-		const shortContainerId = container.id.substring(0, 12);
-		const composeProject = config.Labels?.['com.docker.compose.project'];
-		const composeService = config.Labels?.['com.docker.compose.service'];
-
-		interface NetworkInfo {
-			name: string;
-			aliases: string[];
-			ipv4Address: string | undefined;
-			ipv6Address: string | undefined;
-			gwPriority: number | undefined;
-		}
-
-		const additionalNetworks: NetworkInfo[] = [];
-
-		for (const [netName, netConfig] of Object.entries(networkSettings)) {
-			const netConf = netConfig as any;
-			const isPrimary = netName === primaryNetwork ||
-				(primaryNetwork === 'bridge' && (netName === 'bridge' || netName === 'default'));
-
-			if (isPrimary) {
-				if (containerOptions.networkAliases?.length) {
-					log?.(`Primary network aliases: ${containerOptions.networkAliases.join(', ')}`);
-				}
-				if (containerOptions.networkIpv4Address) {
-					log?.(`Primary network static IPv4: ${containerOptions.networkIpv4Address}`);
-				}
-			} else {
-				const secondaryAliases = ((netConf.Aliases?.length > 0 ? netConf.Aliases : netConf.DNSNames) || [])
-					.filter((a: string) => a !== container.id && a !== shortContainerId);
-
-				if (composeProject && composeService) {
-					if (!secondaryAliases.includes(composeService)) {
-						secondaryAliases.push(composeService);
-					}
-					const projectService = `${composeProject}-${composeService}`;
-					if (!secondaryAliases.includes(projectService)) {
-						secondaryAliases.push(projectService);
-					}
-				}
-
-				additionalNetworks.push({
-					name: netName,
-					aliases: secondaryAliases,
-					ipv4Address: netConf.IPAMConfig?.IPv4Address || undefined,
-					ipv6Address: netConf.IPAMConfig?.IPv6Address || undefined,
-					gwPriority: netConf.GwPriority !== undefined && netConf.GwPriority !== 0
-						? netConf.GwPriority : undefined
-				});
-			}
-		}
-
-		if (additionalNetworks.length > 0) {
-			log?.(`Will reconnect to ${additionalNetworks.length} additional network(s)`);
-		}
-
-		log?.('Creating new container...');
-		const newContainer = await createContainer(containerOptions, envId);
-
-		for (const netInfo of additionalNetworks) {
-			try {
-				await connectContainerToNetwork(netInfo.name, newContainer.id, envId, {
-					aliases: netInfo.aliases.length > 0 ? netInfo.aliases : undefined,
-					ipv4Address: netInfo.ipv4Address,
-					ipv6Address: netInfo.ipv6Address,
-					gwPriority: netInfo.gwPriority
-				});
-				log?.(`  Connected to: ${netInfo.name}`);
-			} catch (netError: any) {
-				log?.(`  Warning: Failed to connect to "${netInfo.name}": ${netError.message}`);
-			}
-		}
-
-		if (wasRunning) {
-			log?.('Starting new container...');
-			await newContainer.start();
-		}
-
-		log?.('Container recreated successfully');
+		await recreateContainerFromInspect(inspectData, imageName, envId, log);
 		return true;
 	} catch (error: any) {
 		log?.(`Failed to recreate container: ${error.message}`);
@@ -909,42 +650,3 @@ export async function recreateContainer(
 	}
 }
 
-/**
- * Update a container that is part of a Docker Compose stack.
- * Uses `docker compose up -d <service>` which preserves all compose configuration.
- *
- * @returns true if update succeeded, false if stack not found (use fallback)
- */
-export async function updateStackContainer(
-	stackName: string,
-	serviceName: string,
-	envId?: number,
-	log?: (msg: string) => void,
-	composeConfigPath?: string
-): Promise<boolean> {
-	try {
-		log?.(`Looking up stack: ${stackName}`);
-
-		const composeResult = await getStackComposeFile(stackName, envId, composeConfigPath);
-
-		if (!composeResult.success || !composeResult.content) {
-			log?.(`No compose file found for stack "${stackName}"`);
-			log?.(`TIP: Import the stack in Dockhand for compose-native updates`);
-			return false;
-		}
-
-		log?.(`Running: docker compose up -d ${serviceName}`);
-		const result = await updateStackService(stackName, serviceName, envId, composeConfigPath);
-
-		if (result.success) {
-			log?.(`Service ${serviceName} updated via docker compose`);
-			return true;
-		} else {
-			log?.(`docker compose up failed: ${result.error || 'Unknown error'}`);
-			return false;
-		}
-	} catch (error: any) {
-		log?.(`Stack update error: ${error.message}`);
-		return false;
-	}
-}

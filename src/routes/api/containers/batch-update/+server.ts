@@ -3,7 +3,7 @@ import type { RequestHandler } from './$types';
 import { authorize } from '$lib/server/authorize';
 import { listContainers, pullImage, inspectContainer } from '$lib/server/docker';
 import { auditContainer } from '$lib/server/audit';
-import { recreateContainer, updateStackContainer } from '$lib/server/scheduler/tasks/container-update';
+import { recreateContainer } from '$lib/server/scheduler/tasks/container-update';
 
 export interface BatchUpdateResult {
 	containerId: string;
@@ -75,47 +75,15 @@ export const POST: RequestHandler = async (event) => {
 					continue;
 				}
 
-				// Detect if container is part of a Docker Compose stack
-				const containerLabels = config.Labels || {};
-				const composeProject = containerLabels['com.docker.compose.project'];
-				const composeService = containerLabels['com.docker.compose.service'];
-				const isStackContainer = !!composeProject;
-
 				let updateSuccess = false;
 				let newContainerId = containerId;
 
-				if (isStackContainer) {
-					// Stack container: Try docker compose up -d first
-					const stackSuccess = await updateStackContainer(composeProject, composeService!, envIdNum);
-
-					if (stackSuccess) {
-						updateSuccess = true;
-						// Find the new container ID
-						const updatedContainers = await listContainers(true, envIdNum);
-						const updatedContainer = updatedContainers.find(c => c.name === containerName);
-						if (updatedContainer) {
-							newContainerId = updatedContainer.id;
-						}
-					} else {
-						// Fallback: Stack is external, use container recreation
-						updateSuccess = await recreateContainer(containerName, envIdNum);
-						if (updateSuccess) {
-							const updatedContainers = await listContainers(true, envIdNum);
-							const updatedContainer = updatedContainers.find(c => c.name === containerName);
-							if (updatedContainer) {
-								newContainerId = updatedContainer.id;
-							}
-						}
-					}
-				} else {
-					// Standalone container: Use shared recreation with ALL settings
-					updateSuccess = await recreateContainer(containerName, envIdNum);
-					if (updateSuccess) {
-						const updatedContainers = await listContainers(true, envIdNum);
-						const updatedContainer = updatedContainers.find(c => c.name === containerName);
-						if (updatedContainer) {
-							newContainerId = updatedContainer.id;
-						}
+				updateSuccess = await recreateContainer(containerName, envIdNum);
+				if (updateSuccess) {
+					const updatedContainers = await listContainers(true, envIdNum);
+					const updatedContainer = updatedContainers.find(c => c.name === containerName);
+					if (updatedContainer) {
+						newContainerId = updatedContainer.id;
 					}
 				}
 

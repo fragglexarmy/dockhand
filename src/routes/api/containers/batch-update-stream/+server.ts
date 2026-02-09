@@ -15,8 +15,7 @@ import { auditContainer } from '$lib/server/audit';
 import { getScannerSettings, scanImage } from '$lib/server/scanner';
 import { saveVulnerabilityScan, removePendingContainerUpdate, type VulnerabilityCriteria } from '$lib/server/db';
 import { parseImageNameAndTag, shouldBlockUpdate, combineScanSummaries, isDockhandContainer } from '$lib/server/scheduler/tasks/update-utils';
-import { recreateContainer, updateStackContainer } from '$lib/server/scheduler/tasks/container-update';
-import { pullStackService } from '$lib/server/stacks';
+import { recreateContainer } from '$lib/server/scheduler/tasks/container-update';
 
 export interface ScanResult {
 	critical: number;
@@ -208,13 +207,6 @@ export const POST: RequestHandler = async (event) => {
 						continue;
 					}
 
-					// Detect stack membership early (needed for both pull and recreate)
-					const containerLabels = config.Labels || {};
-					const composeProject = containerLabels['com.docker.compose.project'];
-					const composeService = containerLabels['com.docker.compose.service'];
-					const composeConfigFiles = containerLabels['com.docker.compose.project.config_files'];
-					const isStackContainer = !!(composeProject && composeService);
-
 					// Step 1: Pull latest image
 					safeEnqueue({
 						type: 'progress',
@@ -227,37 +219,18 @@ export const POST: RequestHandler = async (event) => {
 					});
 
 					try {
-						if (isStackContainer) {
-							const pullResult = await pullStackService(composeProject, composeService!, envIdNum, composeConfigFiles);
-							if (!pullResult.success) {
-								// Fallback to direct pull
-								await pullImage(imageName, (data: any) => {
-									if (data.status) {
-										safeEnqueue({
-											type: 'pull_log',
-											containerId,
-											containerName,
-											pullStatus: data.status,
-											pullId: data.id,
-											pullProgress: data.progress
-										});
-									}
-								}, envIdNum);
+						await pullImage(imageName, (data: any) => {
+							if (data.status) {
+								safeEnqueue({
+									type: 'pull_log',
+									containerId,
+									containerName,
+									pullStatus: data.status,
+									pullId: data.id,
+									pullProgress: data.progress
+								});
 							}
-						} else {
-							await pullImage(imageName, (data: any) => {
-								if (data.status) {
-									safeEnqueue({
-										type: 'pull_log',
-										containerId,
-										containerName,
-										pullStatus: data.status,
-										pullId: data.id,
-										pullProgress: data.progress
-									});
-								}
-							}, envIdNum);
-						}
+						}, envIdNum);
 					} catch (pullError: any) {
 						safeEnqueue({
 							type: 'progress',
@@ -481,73 +454,22 @@ export const POST: RequestHandler = async (event) => {
 					let updateSuccess = false;
 					let newContainerId = containerId;
 
-					if (isStackContainer) {
-						// ===================================================================
-						// STACK CONTAINER: Use docker compose up -d to preserve ALL settings
-						// ===================================================================
-						safeEnqueue({
-							type: 'progress',
-							containerId,
-							containerName,
-							step: 'creating',
-							current: i + 1,
-							total: containerIds.length,
-							message: `Updating stack ${composeProject} (service: ${composeService})...`
-						});
+					safeEnqueue({
+						type: 'progress',
+						containerId,
+						containerName,
+						step: 'creating',
+						current: i + 1,
+						total: containerIds.length,
+						message: `Recreating ${containerName}...`
+					});
 
-						// Try stack-based update first
-						const stackSuccess = await updateStackContainer(composeProject, composeService!, envIdNum, logProgress, composeConfigFiles);
-
-						if (stackSuccess) {
-							updateSuccess = true;
-							// Find the new container ID
-							const updatedContainers = await listContainers(true, envIdNum);
-							const updatedContainer = updatedContainers.find(c => c.name === containerName);
-							if (updatedContainer) {
-								newContainerId = updatedContainer.id;
-							}
-						} else {
-							// Fallback: Stack is external, use container recreation with full settings
-							safeEnqueue({
-								type: 'progress',
-								containerId,
-								containerName,
-								step: 'creating',
-								current: i + 1,
-								total: containerIds.length,
-								message: `Recreating ${containerName} (external stack, preserving all settings)...`
-							});
-
-							updateSuccess = await recreateContainer(containerName, envIdNum, logProgress);
-							if (updateSuccess) {
-								const updatedContainers = await listContainers(true, envIdNum);
-								const updatedContainer = updatedContainers.find(c => c.name === containerName);
-								if (updatedContainer) {
-									newContainerId = updatedContainer.id;
-								}
-							}
-						}
-					} else {
-						// ===================================================================
-						// STANDALONE CONTAINER: Use shared recreation with ALL settings
-						// ===================================================================
-						safeEnqueue({
-							type: 'progress',
-							containerId,
-							containerName,
-							step: 'creating',
-							current: i + 1,
-							total: containerIds.length,
-							message: `Recreating ${containerName} (preserving all settings)...`
-						});
-
-						updateSuccess = await recreateContainer(containerName, envIdNum, logProgress);
-						if (updateSuccess) {
-							const updatedContainers = await listContainers(true, envIdNum);
-							const updatedContainer = updatedContainers.find(c => c.name === containerName);
-							if (updatedContainer) {
-								newContainerId = updatedContainer.id;
-							}
+					updateSuccess = await recreateContainer(containerName, envIdNum, logProgress);
+					if (updateSuccess) {
+						const updatedContainers = await listContainers(true, envIdNum);
+						const updatedContainer = updatedContainers.find(c => c.name === containerName);
+						if (updatedContainer) {
+							newContainerId = updatedContainer.id;
 						}
 					}
 

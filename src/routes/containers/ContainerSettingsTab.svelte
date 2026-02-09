@@ -125,9 +125,6 @@
 		autoUpdateEnabled: boolean;
 		autoUpdateCronExpression: string;
 		vulnerabilityCriteria: VulnerabilityCriteria;
-		// Compose stack info
-		isComposeContainer?: boolean;
-		composeStackName?: string;
 		// Config sets
 		configSets: ConfigSet[];
 		selectedConfigSetId: string;
@@ -192,8 +189,6 @@
 		autoUpdateEnabled = $bindable(),
 		autoUpdateCronExpression = $bindable(),
 		vulnerabilityCriteria = $bindable(),
-		isComposeContainer = false,
-		composeStackName = '',
 		configSets,
 		selectedConfigSetId = $bindable(),
 		errors = $bindable(),
@@ -1468,8 +1463,6 @@
 			bind:cronExpression={autoUpdateCronExpression}
 			bind:vulnerabilityCriteria={vulnerabilityCriteria}
 			systemContainer={detectSystemContainer(image)}
-			{isComposeContainer}
-			{composeStackName}
 		/>
 	</div>
 </div>
